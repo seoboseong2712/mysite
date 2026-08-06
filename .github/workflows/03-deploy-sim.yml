@@ -1,0 +1,31 @@
+name: Deploy Simulation
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+      - name: Build application
+        run: |
+          echo "=============================="
+          echo "Build started"
+          echo "Checking application files"
+          ls -al
+          echo "Build completed"
+          echo "=============================="
+        - name: Deploy application
+        run: |
+          echo "=============================="
+          echo "Connecting to server..."
+          echo "Pulling latest code..."
+          echo "Installing dependencies..."
+          echo "Restarting application service..."
+          echo "Deploy done!"
+          echo "=============================="
