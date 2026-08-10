@@ -6,7 +6,6 @@ on:
       - main
 
 # GitHub Actions 화면에서 수동 실행
-workflow_dispatch:
 
 permissions:
   contents: read
