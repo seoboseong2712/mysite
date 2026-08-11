@@ -1,47 +1,34 @@
-name: Test and Deploy Django
+name: Test, Build AMI and Refresh ASG
 
 on:
   push:
     branches:
       - main
-
-# GitHub Actions 화면에서 수동 실행
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# 동일 프로젝트의 배포가 동시에 실행되지 않도록 제한
 concurrency:
   group: mysite-production-deploy
   cancel-in-progress: false
 
 env:
   AWS_REGION: ap-northeast-2
-
-  # 배포 대상 EC2 태그
-  PROJECT_TAG: mysite
-  ENVIRONMENT_TAG: production
-
-  # 배포 대상 GitHub 저장소
   GIT_REPOSITORY: https://github.com/seoboseong2712/mysite.git
-
-  # EC2 내부 경로
   PROJECT_DIR: /home/ubuntu/mysite
   VENV_DIR: /home/ubuntu/mysite/venv
-
-  # systemd 서비스 이름
   GUNICORN_SERVICE: gunicorn
-
-  # EFS 미디어 마운트 경로
   EFS_MOUNT_POINT: /srv/efs/mysite/media
-
-  # Django collectstatic 결과 업로드 위치 (수정)
   S3_STATIC_URI: s3://mysite-boseong/static/
 
+  # ASG/AMI 배포 설정
+  # 기존 서비스용 Backend A/B와 ASG 인스턴스를 태그로 섞어 찾지 않고,
+  # Golden Image 제작용 EC2 한 대를 GitHub Secret으로 명시한다.
+  LAUNCH_TEMPLATE_NAME: mysite-backend-template
+  ASG_NAME: mysite-django-asg
+
 jobs:
-  # ============================================================
-  # 1. Django 테스트
-  # ============================================================
   test:
     name: Run Django Tests
     runs-on: ubuntu-latest
@@ -135,25 +122,22 @@ jobs:
           set -Eeuo pipefail
           python manage.py test board --verbosity 2
 
+
   # ============================================================
-  # 2. AWS 배포
-  # 테스트에 성공한 경우에만 실행
+  # 2. Golden Image 생성 + ASG Instance Refresh
   # ============================================================
   deploy:
-    name: Deploy to Private EC2
+    name: Build AMI and Refresh ASG
     runs-on: ubuntu-latest
     needs: test
-
     environment: production
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v5
 
-      # OIDC를 사용하지 않고 IAM 사용자 Access Key 사용
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
-
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -165,63 +149,38 @@ jobs:
           aws sts get-caller-identity
 
       # ----------------------------------------------------------
-      # 태그가 일치하는 실행 중 Django EC2 전체 조회
-      # 태그:
-      # Project=mysite
-      # Environment=production
+      # Golden Image 제작용 기준 EC2
+      # GitHub Environment(production) Secret:
+      # AMI_BUILDER_INSTANCE_ID = 기존 mysite-backend-A의 Instance ID 권장
       # ----------------------------------------------------------
-      - name: Find Django EC2 instances
-        id: django_instances
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          
-          INSTANCE_IDS=$(aws ec2 describe-instances \
-            --region "$AWS_REGION" \
-            --filters \
-              "Name=tag:Project,Values=$PROJECT_TAG" \
-              "Name=tag:Environment,Values=$ENVIRONMENT_TAG" \
-              "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" \
-            --output text)
-
-          if [ -z "$INSTANCE_IDS" ]; then
-            echo "배포 대상 Django EC2를 찾지 못했습니다."
-            exit 1
-          fi
-
-          INSTANCE_COUNT=$(wc -w <<< "$INSTANCE_IDS")
-
-          echo "배포 대상 EC2: $INSTANCE_IDS"
-          echo "검색된 서버 수: $INSTANCE_COUNT"
-
-          echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
-          echo "instance_count=$INSTANCE_COUNT" >> "$GITHUB_OUTPUT"
-
-      # ----------------------------------------------------------
-      # 조회된 Django EC2 중 한 대를 작업 서버로 선택
-      # 별도의 StaticPublisher 태그는 사용하지 않음
-      # ----------------------------------------------------------
-      - name: Select one EC2 for migration and static publishing
-        id: primary_instance
+      - name: Validate AMI builder instance
+        id: builder
         shell: bash
         env:
-          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+          AMI_BUILDER_INSTANCE_ID: ${{ secrets.AMI_BUILDER_INSTANCE_ID }}
         run: |
           set -Eeuo pipefail
 
-          PRIMARY_INSTANCE_ID=$(awk '{print $1}' <<< "$INSTANCE_IDS")
-
-          if [ -z "$PRIMARY_INSTANCE_ID" ]; then
-            echo "migrate 및 정적 파일 배포에 사용할 EC2를 선택하지 못했습니다."
+          if [ -z "${AMI_BUILDER_INSTANCE_ID:-}" ]; then
+            echo "GitHub Secret AMI_BUILDER_INSTANCE_ID가 필요합니다."
             exit 1
           fi
 
-          echo "선택된 작업 EC2: $PRIMARY_INSTANCE_ID"
-          echo "instance_id=$PRIMARY_INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$AMI_BUILDER_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          if [ "$STATE" != "running" ]; then
+            echo "AMI Builder EC2가 running 상태가 아닙니다: $STATE"
+            exit 1
+          fi
+
+          echo "AMI Builder: $AMI_BUILDER_INSTANCE_ID"
+          echo "instance_id=$AMI_BUILDER_INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------------------------
-      # 개별 GitHub Secrets로 운영용 .env 내용 구성
+      # 운영 .env 생성
       # ----------------------------------------------------------
       - name: Build production environment file
         id: production_env
@@ -230,14 +189,12 @@ jobs:
           DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
           DJANGO_DEBUG: ${{ secrets.DJANGO_DEBUG }}
           DJANGO_ALLOWED_HOSTS: ${{ secrets.DJANGO_ALLOWED_HOSTS }}
-
           DB_ENGINE: ${{ secrets.DB_ENGINE }}
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: ${{ secrets.DB_PORT }}
-          
           STATIC_URL: ${{ secrets.STATIC_URL }}
           STATIC_ROOT: ${{ secrets.STATIC_ROOT }}
           MEDIA_ROOT: ${{ secrets.MEDIA_ROOT }}
@@ -245,18 +202,9 @@ jobs:
           set -Eeuo pipefail
 
           REQUIRED_SECRETS=(
-            DJANGO_SECRET_KEY
-            DJANGO_DEBUG
-            DJANGO_ALLOWED_HOSTS
-            DB_ENGINE
-            DB_NAME
-            DB_USER
-            DB_PASSWORD
-            DB_HOST
-            DB_PORT
-            STATIC_URL
-            STATIC_ROOT
-            MEDIA_ROOT
+            DJANGO_SECRET_KEY DJANGO_DEBUG DJANGO_ALLOWED_HOSTS
+            DB_ENGINE DB_NAME DB_USER DB_PASSWORD DB_HOST DB_PORT
+            STATIC_URL STATIC_ROOT MEDIA_ROOT
           )
 
           for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
@@ -272,70 +220,39 @@ jobs:
           from pathlib import Path
 
           groups = [
-            (
-              "# Django",
-              [
-                "DJANGO_SECRET_KEY",
-                "DJANGO_DEBUG",
-                "DJANGO_ALLOWED_HOSTS",
-              ],
-            ),
-            (
-              "# MariaDB",
-              [
-                "DB_ENGINE",
-                "DB_NAME",
-                "DB_USER",
-                "DB_PASSWORD",
-                "DB_HOST",
-                "DB_PORT",
-              ],
-            ),
-            (
-              "# 정적 파일 및 미디어",
-              [
-                "STATIC_URL",
-                "STATIC_ROOT",
-                "MEDIA_ROOT",
-              ],
-            ),
+              ("# Django", ["DJANGO_SECRET_KEY", "DJANGO_DEBUG", "DJANGO_ALLOWED_HOSTS"]),
+              ("# MariaDB", ["DB_ENGINE", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT"]),
+              ("# 정적 파일 및 미디어", ["STATIC_URL", "STATIC_ROOT", "MEDIA_ROOT"]),
           ]
 
           lines = []
-          
-          for title, group_keys in groups:
-            lines.append(title)
-
-            for key in group_keys:
-              lines.append(f"{key}={json.dumps(os.environ[key])}")
+          for title, keys in groups:
+              lines.append(title)
+              for key in keys:
+                  lines.append(f"{key}={json.dumps(os.environ[key])}")
               lines.append("")
 
-          Path("/tmp/production.env").write_text(
-            "\n".join(lines),
-            encoding="utf-8",
-          )
+          Path("/tmp/production.env").write_text("\n".join(lines), encoding="utf-8")
           PY
 
           ENV_BASE64=$(base64 -w 0 /tmp/production.env)
-
           echo "::add-mask::$ENV_BASE64"
           echo "base64=$ENV_BASE64" >> "$GITHUB_OUTPUT"
-
           rm -f /tmp/production.env
 
       # ----------------------------------------------------------
-      # 태그가 일치하는 모든 Django EC2에서 코드 및 환경파일 적용
+      # Builder 한 대에만 최신 코드/환경/의존성을 적용
       # ----------------------------------------------------------
-      - name: Update application on tagged EC2 instances
-        id: update_application
+      - name: Update AMI builder
+        id: update_builder
         shell: bash
         env:
-          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+          BUILDER_ID: ${{ steps.builder.outputs.instance_id }}
           PRODUCTION_ENV_BASE64: ${{ steps.production_env.outputs.base64 }}
           EFS_ENDPOINT: ${{ secrets.EFS_ENDPOINT }}
         run: |
           set -Eeuo pipefail
-          
+
           if [ -z "${EFS_ENDPOINT:-}" ]; then
             echo "필수 GitHub Secret이 비어 있습니다: EFS_ENDPOINT"
             exit 1
@@ -352,11 +269,6 @@ jobs:
           EFS_MOUNT_POINT="$EFS_MOUNT_POINT"
           ENV_FILE="\$PROJECT_DIR/.env"
 
-          echo "========================================"
-          echo "서버: \$(hostname)"
-          echo "Django 애플리케이션 배포 준비"
-          echo "========================================"
-
           if [ ! -d "\$PROJECT_DIR/.git" ]; then
             echo "Git 프로젝트를 찾을 수 없습니다: \$PROJECT_DIR"
             exit 1
@@ -367,17 +279,12 @@ jobs:
             exit 1
           fi
 
-          echo "[1/11] EFS 마운트 도구 확인"
-
           if ! command -v mount.nfs4 >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common
           fi
 
-          echo "[2/11] EFS 마운트 디렉터리 및 fstab 구성"
-
           mkdir -p "\$EFS_MOUNT_POINT"
-
           EFS_HOST="\${EFS_ENDPOINT%%:*}"
           EFS_SOURCE="\${EFS_HOST}:/"
           FSTAB_OPTIONS="nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev,nofail,x-systemd.automount"
@@ -388,475 +295,356 @@ jobs:
           printf '%s\n' "\$FSTAB_ENTRY" >> /etc/fstab
 
           systemctl daemon-reload
-
           if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
             mount "\$EFS_MOUNT_POINT"
           fi
-
-          if ! mountpoint -q "\$EFS_MOUNT_POINT"; then
-            echo "EFS 마운트에 실패했습니다: \$EFS_SOURCE -> \$EFS_MOUNT_POINT"
-            exit 1
-          fi
-
-          findmnt "\$EFS_MOUNT_POINT"
-
-          echo "[3/11] Gunicorn의 EFS 마운트 의존성 구성"
+          mountpoint -q "\$EFS_MOUNT_POINT"
 
           mkdir -p "/etc/systemd/system/\$GUNICORN_SERVICE.service.d"
-
           cat > "/etc/systemd/system/\$GUNICORN_SERVICE.service.d/efs-mount.conf" <<EOF_SYSTEMD
           [Unit]
           Wants=network-online.target remote-fs.target
           After=network-online.target remote-fs.target
           RequiresMountsFor=\$EFS_MOUNT_POINT
           EOF_SYSTEMD
-
           systemctl daemon-reload
 
-          echo "[4/11] GitHub 원격 저장소 확인 및 설정"
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" remote set-url origin "\$GIT_REPOSITORY"
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" fetch --prune origin
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" reset --hard
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" clean -fd -e .env -e media/ -e staticfiles/
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" checkout -B main origin/main
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" reset --hard origin/main
 
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" remote set-url origin "\$GIT_REPOSITORY"
-
-          CURRENT_REMOTE=\$(sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" remote get-url origin)
-
-          echo "현재 origin: \$CURRENT_REMOTE"
-
-          if [ "\$CURRENT_REMOTE" != "\$GIT_REPOSITORY" ]; then
-            echo "원격 저장소 설정이 올바르지 않습니다."
-            exit 1
-          fi
-
-          echo "[5/11] GitHub 최신 정보 조회"
-
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" fetch --prune origin
-
-          echo "[6/11] 기존 배포 파일 정리"
-
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" reset --hard
-
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" clean -fd \
-              -e .env \
-              -e media/ \
-              -e staticfiles/
-          
-          echo "[7/11] origin/main 기준으로 main 브랜치 구성"
-
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" checkout -B main origin/main
-
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" reset --hard origin/main
-
-          echo "[8/11] 운영 .env 파일 생성"
-
-          printf '%s' "$PRODUCTION_ENV_BASE64" \
-            | base64 --decode \
-            > "\$ENV_FILE"
-
+          printf '%s' "$PRODUCTION_ENV_BASE64" | base64 --decode > "\$ENV_FILE"
           chown ubuntu:ubuntu "\$ENV_FILE"
           chmod 600 "\$ENV_FILE"
 
-          if [ ! -s "\$ENV_FILE" ]; then
-            echo ".env 파일 생성에 실패했습니다."
-            exit 1
-          fi
-
-          echo "[9/11] pip 업그레이드"
-
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            -m pip install --upgrade pip
-
-          echo "[10/11] requirements.txt 설치"
-
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/pip" \
-            install -r "\$PROJECT_DIR/requirements.txt"
-
-          echo "[11/11] Django 설정 검사 및 적용값 확인"
+          sudo -u ubuntu -H "\$VENV_DIR/bin/python" -m pip install --upgrade pip
+          sudo -u ubuntu -H "\$VENV_DIR/bin/pip" install -r "\$PROJECT_DIR/requirements.txt"
 
           cd "\$PROJECT_DIR"
+          sudo -u ubuntu -H "\$VENV_DIR/bin/python" manage.py check --deploy
 
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            manage.py check --deploy
-
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            manage.py shell -c \
-            "from django.conf import settings; print('STATIC_URL=', settings.STATIC_URL); print('STATIC_ROOT=', settings.STATIC_ROOT); print('MEDIA_ROOT=', settings.MEDIA_ROOT)"
-          
-          echo "EFS 마운트 상태:"
-          findmnt "\$EFS_MOUNT_POINT"
-
-          echo "적용된 Git Commit:"
-
-          sudo -u ubuntu -H \
-            git -C "\$PROJECT_DIR" rev-parse HEAD
-
-          echo "배포 준비 완료"
+          echo "적용 Commit:"
+          sudo -u ubuntu -H git -C "\$PROJECT_DIR" rev-parse HEAD
           SCRIPT
 
-          PARAMETERS=$(jq -n \
-            --arg command "$REMOTE_SCRIPT" \
-            '{commands: [$command]}')
+          PARAMETERS=$(jq -n --arg command "$REMOTE_SCRIPT" '{commands: [$command]}')
 
           COMMAND_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --instance-ids $INSTANCE_IDS \
+            --instance-ids "$BUILDER_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Update mysite and create production environment" \
+            --comment "Prepare mysite AMI builder" \
             --timeout-seconds 1200 \
             --parameters "$PARAMETERS" \
             --query "Command.CommandId" \
             --output text)
 
-          echo "SSM Command ID: $COMMAND_ID"
           echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-      
-      # ----------------------------------------------------------
-      # 대상 EC2 전체의 코드 갱신 및 .env 생성 결과 확인
-      # ----------------------------------------------------------
-      - name: Verify application update
+
+      - name: Verify AMI builder update
         shell: bash
         env:
-          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
-          COMMAND_ID: ${{ steps.update_application.outputs.command_id }}
+          BUILDER_ID: ${{ steps.builder.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.update_builder.outputs.command_id }}
         run: |
           set -Eeuo pipefail
 
-          FAILED=0
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$BUILDER_ID"
 
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            echo "========================================"
-            echo "$INSTANCE_ID 배포 준비 결과"
-            echo "========================================"
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$BUILDER_ID" \
+            --query "Status" \
+            --output text)
 
-            if ! aws ssm wait command-executed \
-              --region "$AWS_REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID"; then
-              FAILED=1
-            fi
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$BUILDER_ID" \
+            --query "StandardOutputContent" \
+            --output text || true
 
-            STATUS=$(aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" \
-              --output text)
-            
-            echo "실행 상태: $STATUS"
-            echo "----- 표준 출력 -----"
-
+          if [ "$STATUS" != "Success" ]; then
             aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
               --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardOutputContent" \
+              --instance-id "$BUILDER_ID" \
+              --query "StandardErrorContent" \
               --output text || true
-
-            if [ "$STATUS" != "Success" ]; then
-              FAILED=1
-              echo "----- 오류 출력 -----"
-
-              aws ssm get-command-invocation \
-                --region "$AWS_REGION" \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardErrorContent" \
-                --output text || true
-            fi
-          done
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "한 대 이상의 EC2에서 배포 준비가 실패했습니다."
             exit 1
           fi
 
       # ----------------------------------------------------------
-      # 조회된 EC2 중 선택된 한 대에서 migrate, collectstatic, S3 sync 수행
+      # DB migration / collectstatic / S3 sync는 Builder에서 1회만 수행
       # ----------------------------------------------------------
       - name: Migrate database and publish static files
-        id: publish_static
+        id: publish
         shell: bash
         env:
-          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
+          BUILDER_ID: ${{ steps.builder.outputs.instance_id }}
         run: |
           set -Eeuo pipefail
 
           read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
           set -Eeuo pipefail
 
-          PROJECT_DIR="$PROJECT_DIR"
-          VENV_DIR="$VENV_DIR"
-          S3_STATIC_URI="$S3_STATIC_URI"
+          cd "$PROJECT_DIR"
 
-          cd "\$PROJECT_DIR"
-
-          if [ ! -f "\$PROJECT_DIR/.env" ]; then
-            echo ".env 파일을 찾을 수 없습니다."
-            exit 1
-          fi
-
-          echo "[1/5] Django 정적 파일 설정 확인"
-
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            manage.py shell -c \
-            "from django.conf import settings; print('STATIC_URL=', settings.STATIC_URL); print('STATIC_ROOT=', settings.STATIC_ROOT)"
-          
-          echo "[2/5] 데이터베이스 마이그레이션"
-          
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            manage.py migrate --noinput
-          
-          echo "[3/5] Django 정적 파일 수집"
-
-          sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            manage.py collectstatic --noinput --clear
+          sudo -u ubuntu -H "$VENV_DIR/bin/python" manage.py migrate --noinput
+          sudo -u ubuntu -H "$VENV_DIR/bin/python" manage.py collectstatic --noinput --clear
 
           STATIC_DIR=\$(sudo -u ubuntu -H \
-            "\$VENV_DIR/bin/python" \
-            manage.py shell -c \
+            "$VENV_DIR/bin/python" manage.py shell -c \
             "from django.conf import settings; print(settings.STATIC_ROOT)" \
-            | tail -n 1 \
-            | tr -d '\r')
-
-          echo "실제 STATIC_ROOT: \$STATIC_DIR"
+            | tail -n 1 | tr -d '\r')
 
           if [ ! -d "\$STATIC_DIR" ]; then
             echo "정적 파일 디렉터리가 없습니다: \$STATIC_DIR"
             exit 1
           fi
-          
-          echo "수집된 정적 파일 개수:"
-          find "\$STATIC_DIR" -type f | wc -l
 
-          echo "[4/5] S3 변경 예정 작업 확인"
+          aws s3 sync "\$STATIC_DIR/" "$S3_STATIC_URI/" --delete
 
-          aws s3 sync \
-            "\$STATIC_DIR/" \
-            "\$S3_STATIC_URI/" \
-            --delete \
-            --dryrun
-
-          echo "[5/5] S3 정적 파일 동기화"
-
-          aws s3 sync \
-            "\$STATIC_DIR/" \
-            "\$S3_STATIC_URI/" \
-            --delete
-
-          aws s3 ls \
-            "\$S3_STATIC_URI/" \
-            --recursive \
-            --summarize
-
-          echo "DB 마이그레이션 및 정적 파일 배포 완료"
+          systemctl restart "$GUNICORN_SERVICE"
+          sleep 3
+          systemctl is-active --quiet "$GUNICORN_SERVICE"
           SCRIPT
 
-          PARAMETERS=$(jq -n \
-            --arg command "$REMOTE_SCRIPT" \
-            '{commands: [$command]}')
+          PARAMETERS=$(jq -n --arg command "$REMOTE_SCRIPT" '{commands: [$command]}')
 
           COMMAND_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --instance-ids "$PRIMARY_INSTANCE_ID" \
+            --instance-ids "$BUILDER_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Migrate database and publish static files" \
+            --comment "Migrate, publish static, verify builder" \
             --timeout-seconds 1200 \
             --parameters "$PARAMETERS" \
             --query "Command.CommandId" \
             --output text)
-          
-          echo "SSM Command ID: $COMMAND_ID"
+
           echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-      
-      # ----------------------------------------------------------
-      # migrate, collectstatic, S3 sync 결과 확인
-      # ----------------------------------------------------------
+
       - name: Verify migration and static deployment
         shell: bash
         env:
-          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
-          COMMAND_ID: ${{ steps.publish_static.outputs.command_id }}
+          BUILDER_ID: ${{ steps.builder.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.publish.outputs.command_id }}
         run: |
           set -Eeuo pipefail
 
-          WAIT_FAILED=0
-
-          if ! aws ssm wait command-executed \
-            --region "$AWS_REGION" \
+          aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "$PRIMARY_INSTANCE_ID"; then
-            WAIT_FAILED=1
-          fi
+            --instance-id "$BUILDER_ID"
 
           STATUS=$(aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
             --command-id "$COMMAND_ID" \
-            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --instance-id "$BUILDER_ID" \
             --query "Status" \
             --output text)
 
-          echo "실행 상태: $STATUS"
-          echo "----- 표준 출력 -----"
-
           aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
             --command-id "$COMMAND_ID" \
-            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --instance-id "$BUILDER_ID" \
             --query "StandardOutputContent" \
             --output text || true
 
-          if [ "$WAIT_FAILED" -ne 0 ] || [ "$STATUS" != "Success" ]; then
-            echo "----- 오류 출력 -----"
-
+          if [ "$STATUS" != "Success" ]; then
             aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
               --command-id "$COMMAND_ID" \
-              --instance-id "$PRIMARY_INSTANCE_ID" \
+              --instance-id "$BUILDER_ID" \
               --query "StandardErrorContent" \
               --output text || true
-
             exit 1
           fi
 
       # ----------------------------------------------------------
-      # 태그가 일치하는 모든 Django EC2의 Gunicorn 재시작
+      # 새 코드가 들어간 Builder를 AMI로 생성
       # ----------------------------------------------------------
-      - name: Restart Gunicorn on tagged EC2 instances
-        id: restart_gunicorn
+      - name: Create AMI
+        id: ami
         shell: bash
         env:
-          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+          BUILDER_ID: ${{ steps.builder.outputs.instance_id }}
         run: |
           set -Eeuo pipefail
-          
-          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
-          set -Eeuo pipefail
 
-          SERVICE_NAME="$GUNICORN_SERVICE"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          AMI_NAME="mysite-${SHORT_SHA}-$(date -u +%Y%m%d-%H%M%S)"
 
-          echo "Gunicorn 재시작"
-          systemctl restart "\$SERVICE_NAME"
-
-          sleep 3
-
-          echo "Gunicorn 활성 상태 확인"
-          systemctl is-active --quiet "\$SERVICE_NAME"
-
-          echo "Gunicorn 서비스 상태"
-          systemctl status "\$SERVICE_NAME" --no-pager
-
-          echo "Gunicorn 재시작 완료"
-          SCRIPT
-
-          PARAMETERS=$(jq -n \
-            --arg command "$REMOTE_SCRIPT" \
-            '{commands: [$command]}')
-          
-          COMMAND_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --instance-ids $INSTANCE_IDS \
-            --document-name "AWS-RunShellScript" \
-            --comment "Restart mysite Gunicorn" \
-            --timeout-seconds 300 \
-            --parameters "$PARAMETERS" \
-            --query "Command.CommandId" \
+          AMI_ID=$(aws ec2 create-image \
+            --instance-id "$BUILDER_ID" \
+            --name "$AMI_NAME" \
+            --description "mysite ${GITHUB_SHA}" \
+            --tag-specifications \
+              "ResourceType=image,Tags=[{Key=Project,Value=mysite},{Key=Environment,Value=production},{Key=GitCommit,Value=${GITHUB_SHA}}]" \
+              "ResourceType=snapshot,Tags=[{Key=Project,Value=mysite},{Key=Environment,Value=production},{Key=GitCommit,Value=${GITHUB_SHA}}]" \
+            --query "ImageId" \
             --output text)
 
-          echo "SSM Command ID: $COMMAND_ID"
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "새 AMI: $AMI_ID ($AMI_NAME)"
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "ami_name=$AMI_NAME" >> "$GITHUB_OUTPUT"
 
-      # ----------------------------------------------------------
-      # 대상 EC2 전체의 Gunicorn 상태 확인
-      # ----------------------------------------------------------
-      - name: Verify Gunicorn
+      - name: Wait for AMI to become available
         shell: bash
         env:
-          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
-          COMMAND_ID: ${{ steps.restart_gunicorn.outputs.command_id }}
+          AMI_ID: ${{ steps.ami.outputs.ami_id }}
         run: |
           set -Eeuo pipefail
-          
-          FAILED=0
+          aws ec2 wait image-available --image-ids "$AMI_ID"
+          aws ec2 describe-images \
+            --image-ids "$AMI_ID" \
+            --query "Images[0].[ImageId,Name,State]" \
+            --output table
 
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            echo "========================================"
-            echo "$INSTANCE_ID Gunicorn 실행 결과"
-            echo "========================================"
+      # ----------------------------------------------------------
+      # 현재 LT 최신 버전을 복사하면서 ImageId만 새 AMI로 교체
+      # ----------------------------------------------------------
+      - name: Create launch template version
+        id: lt
+        shell: bash
+        env:
+          AMI_ID: ${{ steps.ami.outputs.ami_id }}
+        run: |
+          set -Eeuo pipefail
 
-            if ! aws ssm wait command-executed \
-              --region "$AWS_REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID"; then
-              FAILED=1
-            fi
+          VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+            --source-version '$Latest' \
+            --version-description "GitHub ${GITHUB_SHA}" \
+            --launch-template-data "{\"ImageId\":\"$AMI_ID\"}" \
+            --query "LaunchTemplateVersion.VersionNumber" \
+            --output text)
 
-            STATUS=$(aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" \
+          echo "새 Launch Template 버전: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set launch template default version
+        shell: bash
+        env:
+          LT_VERSION: ${{ steps.lt.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          aws ec2 modify-launch-template \
+            --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+            --default-version "$LT_VERSION"
+
+      # ASG가 특정 버전을 사용 중이어도 새 버전으로 명시적으로 갱신
+      - name: Update Auto Scaling Group launch template
+        shell: bash
+        env:
+          LT_VERSION: ${{ steps.lt.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --launch-template \
+              "LaunchTemplateName=$LAUNCH_TEMPLATE_NAME,Version=$LT_VERSION"
+
+      # ----------------------------------------------------------
+      # 새 AMI/LT 버전으로 ASG 인스턴스를 롤링 교체
+      # ----------------------------------------------------------
+      - name: Start ASG instance refresh
+        id: refresh
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":30,"SkipMatching":true}' \
+            --query "InstanceRefreshId" \
+            --output text)
+
+          echo "Instance Refresh ID: $REFRESH_ID"
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for instance refresh
+        shell: bash
+        env:
+          REFRESH_ID: ${{ steps.refresh.outputs.refresh_id }}
+        run: |
+          set -Eeuo pipefail
+
+          # 최대 약 30분 대기. 실습 환경에서는 보통 훨씬 빨리 끝난다.
+          for i in $(seq 1 90); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
               --output text)
 
-              echo "실행 상태: $STATUS"
-              echo "----- 표준 출력 -----"
+            PERCENT=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].PercentageComplete" \
+              --output text)
 
-              aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "StandardOutputContent" \
-              --output text || true
+            echo "Instance Refresh: status=$STATUS, progress=${PERCENT}%"
 
-            if [ "$STATUS" != "Success" ]; then
-              FAILED=1
-              echo "----- 오류 출력 -----"
-              
-              aws ssm get-command-invocation \
-                --region "$AWS_REGION" \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardErrorContent" \
-                --output text || true
-            fi
+            case "$STATUS" in
+              Successful)
+                exit 0
+                ;;
+              Failed|Cancelled|RollbackFailed|RollbackSuccessful)
+                aws autoscaling describe-instance-refreshes \
+                  --auto-scaling-group-name "$ASG_NAME" \
+                  --instance-refresh-ids "$REFRESH_ID" \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 20
           done
 
-          if [ "$FAILED" -ne 0 ]; then
-            echo "한 대 이상의 EC2에서 Gunicorn 재시작이 실패했습니다."
+          echo "Instance Refresh 대기 시간이 초과되었습니다."
+          exit 1
+
+      # ----------------------------------------------------------
+      # 최종 ASG/Target 상태 확인
+      # ----------------------------------------------------------
+      - name: Verify ASG instances
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[].{InstanceId:InstanceId,Lifecycle:LifecycleState,Health:HealthStatus,LTVersion:LaunchTemplate.Version}" \
+            --output table
+
+          BAD_COUNT=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "length(AutoScalingGroups[0].Instances[?LifecycleState!='InService' || HealthStatus!='Healthy'])" \
+            --output text)
+
+          if [ "$BAD_COUNT" != "0" ]; then
+            echo "InService/Healthy가 아닌 ASG 인스턴스가 있습니다."
             exit 1
           fi
-      
-      # ----------------------------------------------------------
-      # GitHub Actions 실행 결과 요약
-      # ----------------------------------------------------------
+
       - name: Deployment summary
         env:
-          INSTANCE_COUNT: ${{ steps.django_instances.outputs.instance_count }}
+          AMI_ID: ${{ steps.ami.outputs.ami_id }}
+          AMI_NAME: ${{ steps.ami.outputs.ami_name }}
+          LT_VERSION: ${{ steps.lt.outputs.version }}
+          REFRESH_ID: ${{ steps.refresh.outputs.refresh_id }}
         run: |
           {
-            echo "## Mysite 배포 완료"
+            echo "## Mysite ASG 배포 완료"
             echo
             echo "- Django 테스트: 성공"
-            echo "- 배포 브랜치: \`${GITHUB_REF_NAME}\`"
-            echo "- 배포 Commit: \`${GITHUB_SHA}\`"
-            echo "- 배포 저장소: \`${GIT_REPOSITORY}\`"
-            echo "- Django EC2: ${INSTANCE_COUNT}대"
-            echo "- 운영 .env: GitHub Secrets로 생성"
-            echo "- EFS: /srv/efs/mysite/media 자동 마운트 구성"
-            echo "- STATIC_URL: GitHub Secret로 적용"
-            echo "- DB 마이그레이션: 완료"
-            echo "- collectstatic: 완료"
-            echo "- S3 정적 파일 동기화: 완료"
-            echo "- Gunicorn 재시작: 완료"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- AMI: \`${AMI_ID}\` (\`${AMI_NAME}\`)"
+            echo "- Launch Template: \`${LAUNCH_TEMPLATE_NAME}\` v\`${LT_VERSION}\`"
+            echo "- Auto Scaling Group: \`${ASG_NAME}\`"
+            echo "- Instance Refresh: \`${REFRESH_ID}\`"
+            echo "- DB migration: 완료"
+            echo "- collectstatic/S3 sync: 완료"
+            echo "- ASG 인스턴스: InService / Healthy 확인"
           } >> "$GITHUB_STEP_SUMMARY"
