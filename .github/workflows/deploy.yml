@@ -26,8 +26,8 @@ env:
   GIT_REPOSITORY: https://github.com/seoboseong2712/mysite.git
 
   # EC2 내부 경로
-  PROJECT_DIR: /home/ubuntu/djangowork/mysite
-  VENV_DIR: /home/ubuntu/djangowork/mysite/workenv
+  PROJECT_DIR: /home/ubuntu/mysite
+  VENV_DIR: /home/ubuntu/mysite/venv
 
   # systemd 서비스 이름
   GUNICORN_SERVICE: gunicorn
