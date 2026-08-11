@@ -105,7 +105,7 @@ DATABASES = {
     #     'NAME': BASE_DIR / 'db.sqlite3',
     # }
     
-    mariadb연동 시(.env 값 설정 필요)
+    # mariadb연동 시(.env 값 설정 필요)
     "default": {
         "ENGINE": os.getenv(
             "DB_ENGINE",
